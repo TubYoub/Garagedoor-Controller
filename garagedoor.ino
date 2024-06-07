@@ -3,31 +3,35 @@
 
 // WiFi credentials
 const char* ssid = "ssid";
-const char* password = "passwd";
+const char* password = "password";
 
 // HTTP authentication credentials
 const char* http_username = "username";
 const char* http_password = "password";
 
 // Pre-set key for additional security
-const String preSetKey = "YOUR_PRE_SET_KEY";  // Replace with your key
+const String preSetKey = "key";  // Replace with your key
 
 // Pin definitions
-const int magnetSensorPin = D0;  // Digital pin for magnet sensor
-const int relayPin = D1;         // Digital pin for relay module
+const int magnetSensorPin = D1;  // Digital pin for magnet sensor
+const int relayPin = D2;         // Digital pin for relay module
 
 // Cooldown period in milliseconds
-const unsigned long cooldownPeriod = 2000; // 2 seconds
+const unsigned long cooldownPeriod = 1000; // 1 second
 
 // Variables to track button state
 unsigned long lastToggleTime = 0;
 bool isButtonDisabled = false;
 
 // Session management
-String sessionID = "";
-unsigned long sessionExpiryTime = 0; // in milliseconds
+struct UserSession {
+    String id;
+    unsigned long expiryTime;
+};
+const int MAX_SESSIONS = 10;
+UserSession sessions[MAX_SESSIONS];
 const unsigned long sessionDuration = 7 * 24 * 60 * 60 * 1000; // session valid for 7 days
-// Not every of theseSTrings is currently used in the code cause its a little buggy with the html code (fixed soon)
+
 // Text variables for easy editing
 //Boot
 String textConnectedTo = "Connected to ";
@@ -59,10 +63,13 @@ ESP8266WebServer server(80);
 void handleRoot();
 void handleToggle();
 void handleStatus();
-bool is_authentified();
+bool is_authenticated();
 void handleLogin();
 String generateToken();
-void extendSession();
+void extendSession(const String& sessionId);
+int findSession(const String& sessionId);
+void addSession(const String& sessionId, unsigned long expiryTime);
+void removeSession(const String& sessionId);
 
 void setup() {
     Serial.begin(9600);
@@ -109,9 +116,9 @@ void loop() {
 // Handle the root URL
 void handleRoot() {
     String header;
-    if (!is_authentified()){
-        server.sendHeader("Location","/login");
-        server.sendHeader("Cache-Control","no-cache");
+    if (!is_authenticated()) {
+        server.sendHeader("Location", "/login");
+        server.sendHeader("Cache-Control", "no-cache");
         server.send(301);
         return;
     }
@@ -139,41 +146,75 @@ void handleRoot() {
   <button id=\"toggleButton\" onclick=\"toggleDoor()\">" + textToggleButton + "</button>\
   <p id=\"status\"></p>\
   <p id=\"timer\"></p>\
- <script>\
+  <script>\
+    const textDoorIs = '" + textDoorIs + "';\
+    const textClosed = '" + textClosed + "';\
+    const textOpen = '" + textOpen + "';\
+    const textButtonDisabled = '" + textButtonDisabled + "';\
+    const textSeconds = '" + textSeconds + "';\
+    const cooldownPeriod = " + String(cooldownPeriod / 1000) + ";\
+    let buttonDisabled = false;\
+    let remainingTime = 0;\
+    \
     function toggleDoor() {\
-      fetch('/toggle', { method: 'POST' });\
+      fetch('/toggle', { method: 'POST' })\
+        .then(response => response.text())\
+        .then(result => {\
+          if (result.includes('Toggled')) {\
+            buttonDisabled = true;\
+            remainingTime = cooldownPeriod;\
+            updateButtonState();\
+          }\
+        });\
     }\
+    \
     function updateStatus() {\
-      fetch('/status').then(response => response.json()).then(data => {\
-        document.getElementById('status').innerText = 'Door is ' + data.doorStatus;\
-        const button = document.getElementById('toggleButton');\
-        if (data.doorStatus === 'Geschlossen') {\
-          button.className = 'closed';\
-        } else {\
-          button.className = 'open';\
-        }\
-        if (data.isButtonDisabled) {\
-          button.disabled = true;\
-          let countdown = data.remainingTime;\
-          const timer = document.getElementById('timer');\
-          timer.innerText = 'Button will be re-enabled in ' + countdown + ' seconds';\
-          const interval = setInterval(() => {\
-            countdown--;\
-            if (countdown > 0) {\
-              timer.innerText = 'Button will be re-enabled in ' + countdown + ' seconds';\
-            } else {\
-              clearInterval(interval);\
-              button.disabled = false;\
-              timer.innerText = '';\
-            }\
-          }, 1000);\
-        } else {\
-          document.getElementById('timer').innerText = '';\
-          button.disabled = false;\
-        }\
-      });\
+      fetch('/status')\
+        .then(response => response.json())\
+        .then(data => {\
+          const statusText = textDoorIs + (data.doorStatus === 'Geschlossen' ? textClosed : textOpen);\
+          document.getElementById('status').innerText = statusText;\
+          const button = document.getElementById('toggleButton');\
+          if (data.doorStatus === 'Geschlossen') {\
+            button.className = 'closed';\
+          } else {\
+            button.className = 'open';\
+          }\
+          if (data.isButtonDisabled) {\
+            buttonDisabled = true;\
+            remainingTime = data.remainingTime;\
+            updateButtonState();\
+          } else {\
+            buttonDisabled = false;\
+            document.getElementById('timer').innerText = '';\
+            button.disabled = false;\
+          }\
+        });\
     }\
-    setInterval(updateStatus, 1000);\
+    \
+    function updateButtonState() {\
+      const button = document.getElementById('toggleButton');\
+      const timer = document.getElementById('timer');\
+      button.disabled = buttonDisabled;\
+      if (buttonDisabled) {\
+        timer.innerText = textButtonDisabled + remainingTime + textSeconds;\
+        const interval = setInterval(() => {\
+          remainingTime--;\
+          if (remainingTime > 0) {\
+            timer.innerText = textButtonDisabled + remainingTime + textSeconds;\
+          } else {\
+            clearInterval(interval);\
+            button.disabled = false;\
+            timer.innerText = '';\
+            buttonDisabled = false;\
+          }\
+        }, 1000);\
+      } else {\
+        timer.innerText = '';\
+      }\
+    }\
+    \
+    setInterval(updateStatus, 2000);\
     window.onload = updateStatus;\
   </script>\
 </body>\
@@ -194,14 +235,17 @@ void handleLogin() {
         server.send(301);
         return;
     }
+
+
     if (server.hasArg("USERNAME") && server.hasArg("PASSWORD")) {
         if (server.arg("USERNAME") == http_username && server.arg("PASSWORD") == http_password) {
-            sessionID = generateToken();
-            sessionExpiryTime = millis() + sessionDuration;
+            String newSessionID = generateToken();
+            unsigned long expiryTime = millis() + sessionDuration;
+            addSession(newSessionID, expiryTime);
 
             server.sendHeader("Location", "/");
             server.sendHeader("Cache-Control", "no-cache");
-            server.sendHeader("Set-Cookie", "ESPSESSIONID=" + sessionID + "; Max-Age=" + String(sessionDuration / 1000));
+            server.sendHeader("Set-Cookie", "ESPSESSIONID=" + newSessionID + "; Max-Age=" + String(sessionDuration / 1000));
             server.send(301);
             return;
         }
@@ -252,18 +296,22 @@ String generateToken() {
     return token;
 }
 
-void extendSession() {
-    sessionExpiryTime = millis() + sessionDuration;
-    server.sendHeader("Set-Cookie", "ESPSESSIONID=" + sessionID + "; Max-Age=" + String(sessionDuration / 1000));
+void extendSession(const String& sessionId) {
+    int sessionIndex = findSession(sessionId);
+    if (sessionIndex != -1) {
+        sessions[sessionIndex].expiryTime = millis() + sessionDuration;
+        server.sendHeader("Set-Cookie", "ESPSESSIONID=" + sessionId + "; Max-Age=" + String(sessionDuration / 1000));
+    }
 }
 
 // Handle the toggle URL
 void handleToggle() {
     unsigned long currentTime = millis();
-    if (is_authentified() || (server.hasHeader("Pre-Set-Key") && server.header("Pre-Set-Key") == preSetKey)) {
+    if (is_authenticated() || (server.hasHeader("Pre-Set-Key") && server.header("Pre-Set-Key") == preSetKey)) {
         if (!isButtonDisabled) {
             // Activate the relay for a brief period to simulate a button press
             digitalWrite(relayPin, HIGH);
+            
             delay(500); // Adjust this delay if needed
             digitalWrite(relayPin, LOW);
 
@@ -282,32 +330,92 @@ void handleToggle() {
 // Handle the status URL
 void handleStatus() {
     unsigned long currentTime = millis();
-    if (isButtonDisabled && (currentTime - lastToggleTime >= cooldownPeriod)) {
-        isButtonDisabled = false;
+    if (is_authenticated() || (server.hasHeader("Pre-Set-Key") && server.header("Pre-Set-Key") == preSetKey)) {
+        if (isButtonDisabled && (currentTime - lastToggleTime >= cooldownPeriod)) {
+            isButtonDisabled = false;
+        }
+        bool isClosed = digitalRead(magnetSensorPin) == LOW;
+        String doorStatus = isClosed ? textClosed : textOpen;
+        unsigned long remainingTime = isButtonDisabled ? (cooldownPeriod - (currentTime - lastToggleTime)) / 1000 : 0;
+
+        // Calculate uptime in seconds
+        unsigned long uptimeSeconds = currentTime / 1000;
+        unsigned long seconds = uptimeSeconds % 60;
+        unsigned long minutes = (uptimeSeconds / 60) % 60;
+
+        unsigned long hours = (uptimeSeconds / 3600) % 24;
+        unsigned long days = uptimeSeconds / 86400;
+
+        // Create uptime string
+        String uptime = String(days) + "d " + String(hours) + "h " + String(minutes) + "m " + String(seconds) + "s";
+
+        // Manually create a JSON response string
+        String jsonResponse = "{\"doorStatus\":\"" + doorStatus + "\",";
+        jsonResponse += "\"isButtonDisabled\":" + String(isButtonDisabled ? "true" : "false") + ",";
+        jsonResponse += "\"remainingTime\":" + String(remainingTime) + ",";
+        jsonResponse += "\"uptime\":\"" + uptime + "\"}";
+
+        server.send(200, "application/json", jsonResponse);
+    } else {
+        server.send(401, "text/plain", textSessionExpired);
     }
-    bool isClosed = digitalRead(magnetSensorPin) == LOW;
-    String doorStatus = isClosed ? textClosed : textOpen;
-    unsigned long remainingTime = isButtonDisabled ? (cooldownPeriod - (currentTime - lastToggleTime)) / 1000 : 0;
-
-    // Manually create a JSON response string
-    String jsonResponse = "{\"doorStatus\":\"" + doorStatus + "\",";
-    jsonResponse += "\"isButtonDisabled\":" + String(isButtonDisabled ? "true" : "false") + ",";
-    jsonResponse += "\"remainingTime\":" + String(remainingTime) + "}";
-
-    server.send(200, "application/json", jsonResponse);
 }
 
-bool is_authentified(){
+bool is_authenticated(){
     if (server.hasHeader("Cookie")) {
         String cookie = server.header("Cookie");
-        if (cookie.indexOf("ESPSESSIONID=" + sessionID) != -1) {
-            if (millis() > sessionExpiryTime) {
-                sessionID = ""; // Session expired, clear session ID
-                return false;
+        int index = cookie.indexOf("ESPSESSIONID=");
+        if (index != -1) {
+            int startIndex = index + String("ESPSESSIONID=").length();
+            int endIndex = cookie.indexOf(";", startIndex);
+            if (endIndex == -1) {
+                endIndex = cookie.length();
             }
-            extendSession(); // Extend the session
-            return true;
+            String sessionId = cookie.substring(startIndex, endIndex);
+            int sessionIndex = findSession(sessionId);
+            if (sessionIndex != -1 && millis() < sessions[sessionIndex].expiryTime) {
+                extendSession(sessionId);
+                return true;
+            }
         }
     }
     return false;
+}
+
+int findSession(const String& sessionId) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions[i].id == sessionId) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void addSession(const String& sessionId, unsigned long expiryTime) {
+    for (int i = 0; i < MAX_SESSIONS; i++) {
+        if (sessions[i].id == "") {  // Empty slot
+            sessions[i].id = sessionId;
+            sessions[i].expiryTime = expiryTime;
+            return;
+        }
+    }
+    // If no empty slot is found, overwrite the oldest session
+    unsigned long oldestTime = sessions[0].expiryTime;
+    int oldestIndex = 0;
+    for (int i = 1; i < MAX_SESSIONS; i++) {
+        if (sessions[i].expiryTime < oldestTime) {
+            oldestTime = sessions[i].expiryTime;
+            oldestIndex = i;
+        }
+    }
+    sessions[oldestIndex].id = sessionId;
+    sessions[oldestIndex].expiryTime = expiryTime;
+}
+
+void removeSession(const String& sessionId) {
+    int sessionIndex = findSession(sessionId);
+    if (sessionIndex != -1) {
+        sessions[sessionIndex].id = "";
+        sessions[sessionIndex].expiryTime = 0;
+    }
 }
